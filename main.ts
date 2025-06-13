@@ -5,7 +5,8 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
-	requestUrl
+	requestUrl,
+	TFile,
 } from "obsidian";
 
 import { stopwords } from "./english-stopwords";
@@ -14,7 +15,7 @@ import { prompts } from "./prompts";
 //**********
 //DEBUG flag: console.log non-error statements enabled
 //**********
-const DEBUG = true
+const DEBUG = true;
 
 const path = require("path");
 
@@ -32,16 +33,18 @@ const DEFAULT_SETTINGS: PaperNoteFillerPluginSettings = {
 	fileNaming: NAMING_TYPES[0],
 	openAIKey: "N/A",
 	openAIModel: "gpt-4o-mini",
-	openAIEndpoint: "https://api.openai.com/v1/chat/completions"
+	openAIEndpoint: "https://api.openai.com/v1/chat/completions",
 };
 
 //all strings ever needed can be found here
 const STRING_MAP: Map<string, string> = new Map([
 	[
-		"error", "Something went wrong. Check the Obsidian console if the error persists."
+		"error",
+		"Something went wrong. Check the Obsidian console if the error persists.",
 	],
 	[
-		"openAIError", "Something went wrong when querying OpenAI. Check the Obsidian console if the error persists."
+		"openAIError",
+		"Something went wrong when querying OpenAI. Check the Obsidian console if the error persists.",
 	],
 	["unsupportedUrl", "This URL is not supported. You tried to enter: "],
 	[
@@ -51,16 +54,24 @@ const STRING_MAP: Map<string, string> = new Map([
 	["semanticScholarError", "Error fetching data from Semantic Scholar"],
 	["commandId", "url-to-paper-note"],
 	["commandName", "Create paper note from URL."],
+	["pdfCommandId", "pdf-to-paper-note"],
+	["pdfCommandName", "Create paper note from current PDF"],
 	["inputLabel1", "Enter a valid URL."],
 	["inputLabel2", "Here are some examples: "],
 	["arXivRestAPI", "https://export.arxiv.org/api/query?id_list="],
 	["aclAnthologyUrlExample", "https://aclanthology.org/2022.acl-long.1/"],
 	["arXivUrlExample", "https://arxiv.org/abs/0000.00000"],
-	["semanticScholarUrlExample", "https://www.semanticscholar.org/paper/some-text/0000.00000"],
+	[
+		"semanticScholarUrlExample",
+		"https://www.semanticscholar.org/paper/some-text/0000.00000",
+	],
 	["inputPlaceholder", "https://my-url.com"],
 	["arxivUrlSuffix", "arXiv:"],
 	["aclAnthologyUrlSuffix", "ACL:"],
-	["semanticScholarFields", "fields=authors,title,abstract,url,venue,year,publicationDate,externalIds"],
+	[
+		"semanticScholarFields",
+		"fields=authors,title,abstract,url,venue,year,publicationDate,externalIds",
+	],
 	["semanticScholarAPI", "https://api.semanticscholar.org/graph/v1/paper/"],
 	["settingHeader", "Settings to create paper notes."],
 	["settingFolderName", "Folder"],
@@ -69,15 +80,29 @@ const STRING_MAP: Map<string, string> = new Map([
 	["settingNoteName", "Note naming"],
 	["settingNoteDesc", "Method to name the note."],
 	["settingOpenAIName", "OpenAI key"],
-	["settingOpenAIDesc", `Provide a valid OpenAI key for LLM integration, otherwise use '${DEFAULT_SETTINGS.openAIKey}'.`],
+	[
+		"settingOpenAIDesc",
+		`Provide a valid OpenAI key for LLM integration, otherwise use '${DEFAULT_SETTINGS.openAIKey}'.`,
+	],
 	["settingOpenAIModelName", "OpenAI model name"],
-	["settingOpenAIModelDesc", "Provide the name of an OpenAI model suitable for chat completion, e.g. gpt-4o-mini."],
+	[
+		"settingOpenAIModelDesc",
+		"Provide the name of an OpenAI model suitable for chat completion, e.g. gpt-4o-mini.",
+	],
 	["settingOpenAIEndpointName", "OpenAI chat endpoint"],
-	["settingOpenAIEndpointDesc", "Provide a valid OpenAI chat completion endpoint, e.g. https://api.openai.com/v1/chat/completions."],
+	[
+		"settingOpenAIEndpointDesc",
+		"Provide a valid OpenAI chat completion endpoint, e.g. https://api.openai.com/v1/chat/completions.",
+	],
 	["noticeRetrievingArxiv", "Retrieving paper information from arXiv API."],
-	["noticeRetrievingSS", "Retrieving paper information from Semantic Scholar API."],
-	["llmMarker", "💻"]
-
+	[
+		"noticeRetrievingSS",
+		"Retrieving paper information from Semantic Scholar API.",
+	],
+	["llmMarker", "💻"],
+	["noPdfOpen", "No PDF file is currently open."],
+	["noArxivId", "Could not extract arXiv ID from PDF filename."],
+	["arxivIdFound", "Found arXiv ID: "],
 ]);
 
 function trimString(str: string | null): string {
@@ -108,10 +133,19 @@ export default class PaperNoteFillerPlugin extends Plugin {
 			},
 		});
 
+		// New command for PDF processing
+		this.addCommand({
+			id: STRING_MAP.get("pdfCommandId")!,
+			name: STRING_MAP.get("pdfCommandName")!,
+			callback: () => {
+				this.processCurrentPdf();
+			},
+		});
+
 		this.addSettingTab(new SettingTab(this.app, this));
 	}
 
-	onunload() { }
+	onunload() {}
 
 	async loadSettings() {
 		this.settings = Object.assign(
@@ -124,6 +158,59 @@ export default class PaperNoteFillerPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	extractArxivIdFromFilename(filename: string): string | null {
+		// Common arXiv ID patterns in filenames:
+		// 1. Direct format: 2301.12345.pdf
+		// 2. With prefix: arxiv_2301.12345.pdf
+		// 3. With dots: 2301.12345v1.pdf
+		// 4. Old format: math.GT/0309136.pdf
+
+		const patterns = [
+			// New format: YYMM.NNNNN[vN]
+			/(\d{4}\.\d{4,5}(?:v\d+)?)/,
+			// Old format: subject-class/YYMMnnn
+			/([a-z-]+(?:\.[A-Z]{2})?\/\d{7})/,
+		];
+
+		for (const pattern of patterns) {
+			const match = filename.match(pattern);
+			if (match) {
+				return match[1];
+			}
+		}
+
+		return null;
+	}
+
+	async processCurrentPdf() {
+		const activeFile = this.app.workspace.getActiveFile();
+
+		if (!activeFile || activeFile.extension !== "pdf") {
+			new Notice(STRING_MAP.get("noPdfOpen")!);
+			return;
+		}
+
+		const arxivId = this.extractArxivIdFromFilename(activeFile.name);
+
+		if (!arxivId) {
+			new Notice(STRING_MAP.get("noArxivId")!);
+			return;
+		}
+
+		if (DEBUG) {
+			console.log(STRING_MAP.get("arxivIdFound")! + arxivId);
+		}
+
+		new Notice(STRING_MAP.get("noticeRetrievingArxiv")!);
+
+		// Create a URL modal instance to use its extraction methods
+		const modal = new urlModal(this.app, this.settings);
+		const arxivUrl = `https://arxiv.org/abs/${arxivId}`;
+
+		// Use the existing arXiv extraction logic with PDF link
+		modal.extractFromArxivDirect(arxivUrl, `[[${activeFile.name}]]`);
+	}
 }
 
 class urlModal extends Modal {
@@ -134,7 +221,10 @@ class urlModal extends Modal {
 		this.settings = settings;
 	}
 
-	addTextElementToModal(type: keyof HTMLElementTagNameMap, value: string): void {
+	addTextElementToModal(
+		type: keyof HTMLElementTagNameMap,
+		value: string
+	): void {
 		const { contentEl } = this;
 		contentEl.createEl(type, { text: value });
 	}
@@ -145,14 +235,17 @@ class urlModal extends Modal {
 		return input;
 	}
 
-	addPropertyToElement(element: HTMLElement, property: string, value: string): void {
+	addPropertyToElement(
+		element: HTMLElement,
+		property: string,
+		value: string
+	): void {
 		element.setAttribute(property, value);
 	}
 
 	getIdentifierFromUrl(url: string): string {
 		//if url ends in / remove it
-		if (url.endsWith("/"))
-			url = url.slice(0, -1);
+		if (url.endsWith("/")) url = url.slice(0, -1);
 		return url.split("/").slice(-1)[0];
 	}
 
@@ -161,16 +254,16 @@ class urlModal extends Modal {
 		const payload = {
 			model: this.settings.openAIModel,
 			messages: [{ role: "user", content: prompt }],
-			temperature: 0.0 //no uncertainty
+			temperature: 0.0, //no uncertainty
 		};
 
 		const response = await fetch(this.settings.openAIEndpoint, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				"Authorization": `Bearer ${this.settings.openAIKey}`
+				Authorization: `Bearer ${this.settings.openAIKey}`,
 			},
-			body: JSON.stringify(payload)
+			body: JSON.stringify(payload),
 		});
 
 		if (!response.ok) {
@@ -193,13 +286,12 @@ class urlModal extends Modal {
 			return Promise.resolve("");
 		}
 
-		const future_prompt = `${prompts.get('futureWork')}\n\nPaper: ${paper}`
-		return this.fetchOpenAICompletion(future_prompt)
-			.catch(error => {
-				new Notice(STRING_MAP.get("openAIError")!);
-				console.log(error);
-				return "";
-			});
+		const future_prompt = `${prompts.get("futureWork")}\n\nPaper: ${paper}`;
+		return this.fetchOpenAICompletion(future_prompt).catch((error) => {
+			new Notice(STRING_MAP.get("openAIError")!);
+			console.log(error);
+			return "";
+		});
 	}
 
 	generateTagsFromAbstract(abstract: string): Promise<string> {
@@ -208,43 +300,36 @@ class urlModal extends Modal {
 		}
 
 		const availableTags = (this.app.metadataCache as any).getTags();
-		const tagsString = Object.keys(availableTags).join(' ');
+		const tagsString = Object.keys(availableTags).join(" ");
 
-		const tag_prompt = `${prompts.get('generateTags')}\n\nAbstract: ${abstract}\n\nAvailable hashtags: ${tagsString}`;
+		const tag_prompt = `${prompts.get(
+			"generateTags"
+		)}\n\nAbstract: ${abstract}\n\nAvailable hashtags: ${tagsString}`;
 
-		return this.fetchOpenAICompletion(tag_prompt)
-			.catch(error => {
-				new Notice(STRING_MAP.get("openAIError")!);
-				console.log(error);
-				return "";
-			});
+		return this.fetchOpenAICompletion(tag_prompt).catch((error) => {
+			new Notice(STRING_MAP.get("openAIError")!);
+			console.log(error);
+			return "";
+		});
 	}
 
 	extractFileNameFromUrl(url: string, title: string): string {
-
 		let filename = this.getIdentifierFromUrl(url);
 
-		if (this.settings.fileNaming !== "identifier" &&
-			title != null) {
+		if (this.settings.fileNaming !== "identifier" && title != null) {
 			let sliceEnd = undefined; //default to all terms
-			if (this.settings.fileNaming.includes(
-				"first-3-title-terms"
-			))
+			if (this.settings.fileNaming.includes("first-3-title-terms"))
 				sliceEnd = 3;
-			else if (this.settings.fileNaming.includes(
-				"first-5-title-terms"
-			))
+			else if (this.settings.fileNaming.includes("first-5-title-terms"))
 				sliceEnd = 5;
-			else
-				;
+			else;
 
 			filename = title
 				.split(" ")
 				.filter(
-					(word) => !stopwords.has(word.toLowerCase()) ||
-						!this.settings.fileNaming.includes(
-							"no-stopwords"
-						)
+					(word) =>
+						!stopwords.has(word.toLowerCase()) ||
+						!this.settings.fileNaming.includes("no-stopwords")
 				)
 				.slice(0, sliceEnd)
 				.join(" ")
@@ -261,18 +346,19 @@ class urlModal extends Modal {
 		htmlData: string,
 		venue: string,
 		publicationDate: string,
-		abstract: string
+		abstract: string,
+		localLink?: string
 	): Promise<void> {
 		// Check if the file already exists
 		if (await this.app.vault.adapter.exists(pathToFile)) {
 			new Notice(STRING_MAP.get("fileAlreadyExists")!);
-			this.app.workspace.openLinkText(pathToFile, pathToFile);
-			return;
+			await this.app.workspace.openLinkText(pathToFile, pathToFile);
+			return; // Early return - file exists
 		}
 
 		let tags = await this.generateTagsFromAbstract(abstract);
 		if (tags.length >= 3) {
-			tags = `${STRING_MAP.get("llmMarker")} ${tags}`
+			tags = `${STRING_MAP.get("llmMarker")} ${tags}`;
 		}
 
 		let futureWork = "";
@@ -284,45 +370,59 @@ class urlModal extends Modal {
 			futureWork = `${STRING_MAP.get("llmMarker")} ${futureWork}`;
 		}
 
-		// Create the file and open it
+		let localLinkSection = "";
+		if (localLink) {
+			localLinkSection = "# Local Link" + "\n" + localLink + "\n\n";
+		}
+
+		// Create the file and open it - THIS STILL EXECUTES EVEN AFTER RETURN!
 		await this.app.vault.create(
 			pathToFile,
 			"# Title" +
-			"\n" +
-			trimString(title) +
-			"\n\n" +
-			"# Authors" +
-			"\n" +
-			trimString(authorString) +
-			"\n\n" +
-			"# URL" +
-			"\n" +
-			url +
-			"\n\n" +
-			"# Venue" +
-			"\n" +
-			trimString(venue) +
-			"\n\n" +
-			"# Publication date" +
-			"\n" +
-			trimString(publicationDate) +
-			"\n\n" +
-			"# Abstract" +
-			"\n" +
-			trimString(abstract) +
-			"\n\n" +
-			"# Tags" +
-			"\n" +
-			tags +
-			"\n\n" +
-			"# Notes" +
-			"\n" +
-			"- " + futureWork
-		)
+				"\n" +
+				trimString(title) +
+				"\n\n" +
+				"# Authors" +
+				"\n" +
+				trimString(authorString) +
+				"\n\n" +
+				"# URL" +
+				"\n" +
+				url +
+				"\n\n" +
+				"# Venue" +
+				"\n" +
+				trimString(venue) +
+				"\n\n" +
+				"# Publication date" +
+				"\n" +
+				trimString(publicationDate) +
+				"\n\n" +
+				"# Abstract" +
+				"\n" +
+				trimString(abstract) +
+				"\n\n" +
+				"# Tags" +
+				"\n" +
+				tags +
+				"\n\n" +
+				localLinkSection +
+				"# Notes" +
+				"\n" +
+				"- " +
+				futureWork
+		);
 		await this.app.workspace.openLinkText(pathToFile, pathToFile);
 	}
 
-	parseMetadataFromSemanticScholar(data: string): { title: string; authorString: string; venue: string; publicationDate: string; abstract: string; url: string } {
+	parseMetadataFromSemanticScholar(data: string): {
+		title: string;
+		authorString: string;
+		venue: string;
+		publicationDate: string;
+		abstract: string;
+		url: string;
+	} {
 		const json = JSON.parse(data);
 
 		if (json.error) {
@@ -331,18 +431,30 @@ class urlModal extends Modal {
 
 		const title = json.title || "undefined";
 		const abstract = json.abstract || "";
-		const authors = json.authors.map((author: { name: string }) => author.name).join(", ");
+		const authors = json.authors
+			.map((author: { name: string }) => author.name)
+			.join(", ");
 		const venue = json.venue ? `${json.venue} ${json.year}` : "";
 		const publicationDate = json.publicationDate || "";
 		const url = json.url;
 
-		return { title, authorString: authors, venue, publicationDate, abstract, url };
+		return {
+			title,
+			authorString: authors,
+			venue,
+			publicationDate,
+			abstract,
+			url,
+		};
 	}
 
 	extractFromSemanticScholar(url: string) {
 		const id = this.getIdentifierFromUrl(url);
-		const suffix = url.includes("arxiv") ? STRING_MAP.get("arxivUrlSuffix")! :
-			url.includes("aclanthology") ? STRING_MAP.get("aclAnthologyUrlSuffix")! : "";
+		const suffix = url.includes("arxiv")
+			? STRING_MAP.get("arxivUrlSuffix")!
+			: url.includes("aclanthology")
+			? STRING_MAP.get("aclAnthologyUrlSuffix")!
+			: "";
 
 		if (suffix === "") {
 			new Notice(STRING_MAP.get("unsupportedUrl")! + url);
@@ -351,13 +463,33 @@ class urlModal extends Modal {
 
 		const htmlData = ""; //does not exist for semanticscholar
 
-		fetch(`${STRING_MAP.get("semanticScholarAPI")!}${suffix}${id}?${STRING_MAP.get("semanticScholarFields")!}`)
+		fetch(
+			`${STRING_MAP.get(
+				"semanticScholarAPI"
+			)!}${suffix}${id}?${STRING_MAP.get("semanticScholarFields")!}`
+		)
 			.then((response) => response.text())
 			.then((data) => {
-				const { title, authorString, venue, publicationDate, abstract, url } = this.parseMetadataFromSemanticScholar(data);
+				const {
+					title,
+					authorString,
+					venue,
+					publicationDate,
+					abstract,
+					url,
+				} = this.parseMetadataFromSemanticScholar(data);
 				const filename = this.extractFileNameFromUrl(url, title);
 				const pathToFile = `${this.settings.folderLocation}${path.sep}${filename}.md`;
-				this.generateNoteContent(pathToFile, title, authorString, url, htmlData, venue, publicationDate, abstract);
+				this.generateNoteContent(
+					pathToFile,
+					title,
+					authorString,
+					url,
+					htmlData,
+					venue,
+					publicationDate,
+					abstract
+				);
 			})
 			.catch((error) => {
 				new Notice(STRING_MAP.get("error")!);
@@ -377,12 +509,25 @@ class urlModal extends Modal {
 				const parser = new DOMParser();
 				const xmlDoc = parser.parseFromString(data, "text/xml");
 
-				const title = xmlDoc.getElementsByTagName("title")[1]?.textContent || "undefined";
-				const abstract = xmlDoc.getElementsByTagName("summary")[0]?.textContent || "";
-				const authors = Array.from(xmlDoc.getElementsByTagName("author")).map(
-					(author) => author.getElementsByTagName("name")[0]?.textContent || ""
-				).join(", ");
-				const publicationDate = xmlDoc.getElementsByTagName("published")[0]?.textContent?.split("T")[0] || "";
+				const title =
+					xmlDoc.getElementsByTagName("title")[1]?.textContent ||
+					"undefined";
+				const abstract =
+					xmlDoc.getElementsByTagName("summary")[0]?.textContent ||
+					"";
+				const authors = Array.from(
+					xmlDoc.getElementsByTagName("author")
+				)
+					.map(
+						(author) =>
+							author.getElementsByTagName("name")[0]
+								?.textContent || ""
+					)
+					.join(", ");
+				const publicationDate =
+					xmlDoc
+						.getElementsByTagName("published")[0]
+						?.textContent?.split("T")[0] || "";
 
 				const filename = this.extractFileNameFromUrl(url, title);
 				const pathToFile = `${this.settings.folderLocation}${path.sep}${filename}.md`;
@@ -399,11 +544,14 @@ class urlModal extends Modal {
 						htmlData = decoder.decode(buffer);
 
 						const htmlParser = new DOMParser();
-						const htmlDoc = htmlParser.parseFromString(htmlData, "text/html");
+						const htmlDoc = htmlParser.parseFromString(
+							htmlData,
+							"text/html"
+						);
 						htmlData = htmlDoc.body.textContent || "";
 
 						if (DEBUG == true) {
-							console.log(htmlData)
+							console.log(htmlData);
 						}
 					})
 					.catch((htmlError) => {
@@ -411,7 +559,16 @@ class urlModal extends Modal {
 						htmlData = "";
 					})
 					.finally(() => {
-						this.generateNoteContent(pathToFile, title, authors, url, htmlData, venue, publicationDate, abstract);
+						this.generateNoteContent(
+							pathToFile,
+							title,
+							authors,
+							url,
+							htmlData,
+							venue,
+							publicationDate,
+							abstract
+						);
 						this.close();
 					});
 			})
@@ -420,20 +577,112 @@ class urlModal extends Modal {
 			});
 	}
 
+	// New method for direct arXiv processing (without modal)
+	extractFromArxivDirect(url: string, localLink?: string) {
+		const id = this.getIdentifierFromUrl(url);
+
+		fetch(STRING_MAP.get("arXivRestAPI")! + id)
+			.then((response) => response.text())
+			.then((data) => {
+				const parser = new DOMParser();
+				const xmlDoc = parser.parseFromString(data, "text/xml");
+
+				const title =
+					xmlDoc.getElementsByTagName("title")[1]?.textContent ||
+					"undefined";
+				const abstract =
+					xmlDoc.getElementsByTagName("summary")[0]?.textContent ||
+					"";
+				const authors = Array.from(
+					xmlDoc.getElementsByTagName("author")
+				)
+					.map(
+						(author) =>
+							author.getElementsByTagName("name")[0]
+								?.textContent || ""
+					)
+					.join(", ");
+				const publicationDate =
+					xmlDoc
+						.getElementsByTagName("published")[0]
+						?.textContent?.split("T")[0] || "";
+
+				const filename = this.extractFileNameFromUrl(url, title);
+				const pathToFile = `${this.settings.folderLocation}${path.sep}${filename}.md`;
+
+				const venue = ""; //arxiv has no venue field
+
+				const urlHtmlVersion = url.replace("/abs/", "/html/") + "v1";
+				let htmlData = "";
+
+				return requestUrl(urlHtmlVersion)
+					.then((htmlResponse) => {
+						const buffer = htmlResponse.arrayBuffer;
+						const decoder = new TextDecoder("utf-8");
+						htmlData = decoder.decode(buffer);
+
+						const htmlParser = new DOMParser();
+						const htmlDoc = htmlParser.parseFromString(
+							htmlData,
+							"text/html"
+						);
+						htmlData = htmlDoc.body.textContent || "";
+
+						if (DEBUG == true) {
+							console.log(htmlData);
+						}
+					})
+					.catch((htmlError) => {
+						console.log(htmlError);
+						htmlData = "";
+					})
+					.finally(() => {
+						this.generateNoteContent(
+							pathToFile,
+							title,
+							authors,
+							url,
+							htmlData,
+							venue,
+							publicationDate,
+							abstract,
+							localLink
+						);
+					});
+			})
+			.catch((error) => {
+				console.error("Error fetching arXiv metadata:", error);
+				new Notice(STRING_MAP.get("error")!);
+			});
+	}
 
 	onOpen() {
 		const { contentEl } = this;
 
 		this.addTextElementToModal("h2", STRING_MAP.get("inputLabel1")!);
 		this.addTextElementToModal("p", STRING_MAP.get("inputLabel2")!);
-		this.addTextElementToModal("p", STRING_MAP.get("aclAnthologyUrlExample")!);
+		this.addTextElementToModal(
+			"p",
+			STRING_MAP.get("aclAnthologyUrlExample")!
+		);
 		this.addTextElementToModal("p", STRING_MAP.get("arXivUrlExample")!);
-		this.addTextElementToModal("p", STRING_MAP.get("semanticScholarUrlExample")!);
+		this.addTextElementToModal(
+			"p",
+			STRING_MAP.get("semanticScholarUrlExample")!
+		);
 
 		let input = this.addInputElementToModal("input");
 		this.addPropertyToElement(input, "type", "search");
-		this.addPropertyToElement(input, "placeholder", STRING_MAP.get("inputPlaceholder")!);
-		this.addPropertyToElement(input, "minLength", STRING_MAP.get("inputPlaceholder")!);
+		this.addPropertyToElement(
+			input,
+			"placeholder",
+			STRING_MAP.get("inputPlaceholder")!
+		);
+		this.addPropertyToElement(
+			input,
+			"minLength",
+			STRING_MAP.get("inputPlaceholder")!
+		);
 		this.addPropertyToElement(input, "style", "width: 75%;");
 
 		let extracting = false;
@@ -454,8 +703,7 @@ class urlModal extends Modal {
 				if (url.includes("arxiv.org")) {
 					new Notice(STRING_MAP.get("noticeRetrievingArxiv")!);
 					this.extractFromArxiv(url);
-				}
-				else {
+				} else {
 					new Notice(STRING_MAP.get("noticeRetrievingSS")!);
 					this.extractFromSemanticScholar(url);
 				}
@@ -498,8 +746,7 @@ class SettingTab extends PluginSettingTab {
 					res.push(parts.slice(0, i + 1).join(path.sep));
 				}
 				return res;
-			}
-			)
+			})
 			.flat()
 			.filter((folder, index, self) => self.indexOf(folder) === index);
 
@@ -554,7 +801,7 @@ class SettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.openAIKey)
 					.onChange(async (value) => {
 						this.plugin.settings.openAIKey = value;
-						await this.plugin.saveSettings()
+						await this.plugin.saveSettings();
 					})
 			);
 
@@ -567,7 +814,7 @@ class SettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.openAIModel)
 					.onChange(async (value) => {
 						this.plugin.settings.openAIModel = value;
-						await this.plugin.saveSettings()
+						await this.plugin.saveSettings();
 					})
 			);
 
@@ -580,7 +827,7 @@ class SettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.openAIEndpoint)
 					.onChange(async (value) => {
 						this.plugin.settings.openAIEndpoint = value;
-						await this.plugin.saveSettings()
+						await this.plugin.saveSettings();
 					})
 			);
 	}

@@ -6,7 +6,6 @@ import {
 	PluginSettingTab,
 	Setting,
 	requestUrl,
-	TFile,
 } from "obsidian";
 
 import { stopwords } from "./english-stopwords";
@@ -109,6 +108,10 @@ function trimString(str: string | null): string {
 	if (str == null) return "";
 
 	return str.replace(/\s+/g, " ").trim();
+}
+
+function isStatusOk(status: number): boolean {
+	return status >= 200 && status < 300;
 }
 
 interface PaperNoteFillerPluginSettings {
@@ -257,7 +260,8 @@ class urlModal extends Modal {
 			temperature: 0.0, //no uncertainty
 		};
 
-		const response = await fetch(this.settings.openAIEndpoint, {
+		const response = await requestUrl({
+			url: this.settings.openAIEndpoint,
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -266,8 +270,8 @@ class urlModal extends Modal {
 			body: JSON.stringify(payload),
 		});
 
-		if (!response.ok) {
-			throw new Error(`Error ${response.status}: ${response.statusText}`);
+		if (!isStatusOk(response.status)) {
+			throw new Error(`Error ${response.status}`);
 		}
 
 		const data = await response.json();
@@ -463,12 +467,12 @@ class urlModal extends Modal {
 
 		const htmlData = ""; //does not exist for semanticscholar
 
-		fetch(
+		requestUrl(
 			`${STRING_MAP.get(
 				"semanticScholarAPI"
 			)!}${suffix}${id}?${STRING_MAP.get("semanticScholarFields")!}`
 		)
-			.then((response) => response.text())
+			.then((response) => response.text)
 			.then((data) => {
 				const {
 					title,
@@ -503,8 +507,8 @@ class urlModal extends Modal {
 	extractFromArxiv(url: string) {
 		const id = this.getIdentifierFromUrl(url);
 
-		fetch(STRING_MAP.get("arXivRestAPI")! + id)
-			.then((response) => response.text())
+		requestUrl(STRING_MAP.get("arXivRestAPI")! + id)
+			.then((response) => response.text)
 			.then((data) => {
 				const parser = new DOMParser();
 				const xmlDoc = parser.parseFromString(data, "text/xml");
@@ -581,8 +585,8 @@ class urlModal extends Modal {
 	extractFromArxivDirect(url: string, localLink?: string) {
 		const id = this.getIdentifierFromUrl(url);
 
-		fetch(STRING_MAP.get("arXivRestAPI")! + id)
-			.then((response) => response.text())
+		requestUrl(STRING_MAP.get("arXivRestAPI")! + id)
+			.then((response) => response.text)
 			.then((data) => {
 				const parser = new DOMParser();
 				const xmlDoc = parser.parseFromString(data, "text/xml");
